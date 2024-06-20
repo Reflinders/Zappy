@@ -1,78 +1,58 @@
 --[[
-	@@ Zappy
+	* Zappy
 	
 	Simple and robust reactive state container
 	
-	~ Reflinders
+	@ Reflinders
 ]]
 
 --[[
-	Version => 0.1
+	Version => 1.0 (Release)
 ]]
 
-local OBSV_HEAD_NODE = "obsvnode"
-local TEMP_KEYS = { __mode = "k" }
+local OBSV_HEAD_NODE = "obsvhead"
+local OBSV_TAIL_NODE = "obsvtail"
 
-local freeThread
+local WEAK_KEYS = { __mode = "k" }
 
-function runThread(fn, ...)
-	local temp = freeThread
-	freeThread = nil
-	fn(...)
-	freeThread = temp
-end
-
-function threadYielder(observers)
-	while true do
-		runThread(coroutine.yield())
-	end 
-end
-
-function spawnThread(fn, ...)
-	if not freeThread then
-		freeThread = coroutine.create(threadYielder)
-		coroutine.resume(freeThread)
-	end
-
-	task.spawn(freeThread, fn, ...)	
-end
+--@@ Fn
 
 function decompose(val)
 	--@ if tuple, then return as table
 	--@ if not tuple, return as single value
-	
+
 	local is_tbl = type(val) == "table"
-	
+
 	if is_tbl and #val == 1 then
 		return val[1]
 	end	
-	
+
 	return val
 end
 
 function isEqual(var1, var2)
 	local t1, t2 = type(var1), type(var2)
-	
+
 	if t1 ~= t2 then
 		return false
 	end
-	
+
 	if t1 ~= "table" then
 		return var1 == var2
 	end
-	
+
 	for key, v in pairs(var1) do
 		if v ~= var2[key] then
 			return false
 		end
 	end
-	
+
 	for key, v in pairs(var2) do
 		if v ~= var1[key] then
 			return false
 		end
 	end
-	
+
 	return true
 end
 
@@ -84,40 +64,35 @@ function getStateType(state)
 	if isTuple(state) then
 		return typeof(state[1])
 	end
-	
+
 	return typeof(state)
 end
 
-function hasObservers(obj)
-	local _, catch = next(obj.catchers)
-	
-	return obj[OBSV_HEAD_NODE] ~= nil
-		or catch ~= nil
-end
-
---[[
-	@
-	@
-	@
-]]
-
---@ Class `Observer`
+--@@ Class `Observer`
 
 local Observer = {}
 do
 	Observer.__index = Observer
 
-	function Observer:unsubscribe()
-		if not self.active then
+	function Observer:Unsubscribe()
+		if (self.fn==nil) then
 			return
 		end
 
 		if self.prev then
-			self.prev.next = self.next
+			--@ this is a trailing node
+			-- therefore, detachment is affordable
+			
+			self.prev.next = self.next -- connects the previous node to the next
+			
+			if self.next then
+				self.next.prev = self.prev -- connects the next node to the previous
+			end
+			
 			self.prev = nil
+			self.next = nil
 		end
 
-		self.next = nil
 		self.fn = nil
 	end
 
@@ -125,102 +100,173 @@ do
 		return setmetatable({ 
 			fn = fn;
 			prev = prev;
-			--@
-			--@ next = nil;
+			next = nil;
 		}, Observer)
 	end
 end
 
---@ Class `Zappy`
+--@@ Class `Zappy`
 
 local Zappy = {}
 Zappy.__index = Zappy
 
+do
+	--@static
+	
+	function Zappy.is(obj)
+		return type(obj) == "table" 
+			and getmetatable(obj) == Zappy
+	end
+
+	function Zappy:isTuple()
+		return isTuple(self.state)
+	end
+	
+	--@private
+	
+	function Zappy:_hasObservers()
+		local _, catch = next(self.catchers)
+
+		return self[OBSV_HEAD_NODE] ~= nil
+			or catch ~= nil
+	end
+	
+	function Zappy:_getSetter(fn)
+		--@ mainly used for observers
+		-- arg passed into observer is the literal
+		-- so no need to decompose!
+
+		if fn then
+			return function(val)
+				val = fn(val)
+
+				self:Set(val)
+			end
+		end
+
+		return function(val)
+			self:Set(val)
+		end
+	end
+end
+
+do
+	local freeThread
+
+	local function runThread(fn, ...)
+		local temp = freeThread
+		freeThread = nil
+		fn(...)
+		freeThread = temp
+	end
+
+	local function threadYielder(observers)
+		while true do
+			runThread(coroutine.yield())
+		end 
+	end
+
+	local function spawnThread(fn, ...)
+		if not freeThread then
+			freeThread = coroutine.create(threadYielder)
+			coroutine.resume(freeThread)
+		end
+
+		task.spawn(freeThread, fn, ...)	
+	end
+	
+	function Zappy:_runWatcherThread(state)
+		local node = self[OBSV_HEAD_NODE]
+		local catchers = self.catchers
+
+		for key, catcher in catchers do
+			if catcher.fn then
+				spawnThread(catcher.fn, state)
+			else
+				catchers[key] = nil
+			end
+		end
+		
+		if node and (node.fn==nil) then
+			--@ since the head-node cannot detach itself without reference to the zap-state
+			-- we have to remove it ourselves
+			
+			node = node.next
+			self[OBSV_HEAD_NODE] = node
+		end
+		
+		while (node) do	
+			spawnThread(node.fn, state)
+
+			node = node.next
+		end
+	end
+end
+
+--@pub methods
+
 function Zappy:Destroy()
-	table.clear(self)
+	self.state = nil
+	self.const = nil
+	self.catchers = nil
+	
+	self[OBSV_HEAD_NODE] = nil
+	self[OBSV_TAIL_NODE] = nil
+	
 	setmetatable(self, nil)
 end
 
-function Zappy.is(obj)
-	return type(obj) == "table" 
-		and getmetatable(obj) == Zappy
-end
+function Zappy:Observe(fn)
+	local tail = self[OBSV_TAIL_NODE]
+	local node = Observer.new(fn, tail)
 
-function Zappy.isTuple(obj)
-	return isTuple(obj.state)
-end
-
-function Zappy.observe(zap_state, fn)
-	local head = zap_state[OBSV_HEAD_NODE]
-	local node = Observer.new(fn, head)
-	
-	if head then
-		head.next = node
+	if tail then
+		tail.next = node
+		
+		self[OBSV_TAIL_NODE] = node
 	else
-		zap_state[OBSV_HEAD_NODE] = node
+		self[OBSV_HEAD_NODE] = node
+		self[OBSV_TAIL_NODE] = node
 	end
-	
+
 	return node
 end
 
-function Zappy.catch(zap_state, key, fn)
+function Zappy:Catch(key, fn)
 	local node = Observer.new(fn)
-	zap_state.catchers[key] = node
+	
+	self.catchers[key] = node
+	
 	return node
 end
 
-function Zappy.reduce(zap_state, fn)
-	zap_state.reducer = fn
-	zap_state:set(
-		fn(zap_state.state), true)
-end
-
-function Zappy.getSetter(zap_state, fn)
-	--@ mainly used for observers
-	-- arg passed into observer is the literal
-	-- so no need to decompose!
+function Zappy:Reduce(fn)
+	local success, val = pcall(fn, self.state)
 	
-	if fn then
-		return function(val)
-			val = fn(val)
-			
-			zap_state:set(val)
-		end
+	if (not success) then
+		warn("Couldn't set as reducer by reason of the following error ... ", val)	
+		
+		return	
 	end
 	
-	return function(val)
-		zap_state:set(val)
-	end
-end
-
-function Zappy:_runWatcherThread(state)
-	local node = self[OBSV_HEAD_NODE]
-	local catchers = self.catchers
-
-	for key, catcher in catchers do
-		if catcher.fn then
-			spawnThread(catcher.fn, state)
-		else
-			catchers[key] = nil
-		end
-	end
-
-	while node do
-		spawnThread(node.fn, state)
-
-		node = node.next
-	end
-end
-
-function Zappy:slice(start, terminate)
-	local isString = (type(self.state) == "string")
+	self.reducer = fn
+	self:Set(
+		val, true)
 	
-	if isString then
+	return self
+end
+
+function Zappy:Slice(start, terminate)
+	local isTuple = self:isTuple()
+	local isString = (self.const == "string")
+
+	if (not isTuple) and isString then
 		return self.state:sub(start, terminate)
 	end
-	
-	assert(self:isTuple(), "Attempt to slice a non-tuple")
 
+	assert(isTuple, "Attempt to slice a non-tuple")
+	assert(start <= terminate and terminate <= #self.state, "Attempt to cross tuple boundaries with the start and terminate args!")
+	
 	local slice = {}
 
 	for i = start or 1, terminate or #self.state do
@@ -230,72 +276,95 @@ function Zappy:slice(start, terminate)
 	return slice
 end
 
-function Zappy:unpack()
-	assert(self:isTuple(), "Attempt to slice a non-tuple")
-
+function Zappy:Unpack()
+	local isTuple = self:isTuple()
+	local isString = (self.const == "string")
+	
+	if (not isTuple) and isString then
+		return self.state:split("")
+	end
+	
+	assert(isTuple, "Attempt to unpack an object that isn't a tuple or string")
+	
 	return unpack(self.state)
 end
 
---@ get
-function Zappy:peek()
+--@{ get }
+function Zappy:Peek()
 	return self.state
 end
 
---@ set
-function Zappy:set(val, bypass)
+--@{ set }
+function Zappy:Set(val, bypass)
 	val = decompose(val) -- automatically decomposes the value
-	
+
 	local reducer = self.reducer
-	
+
 	if (not bypass) and reducer then
-		return self:set(reducer(val), true)
+		local success, transformed = pcall(reducer, val)
+		
+		if (not success) then
+			warn("Reducer encountered error ...", transformed)
+			
+			return
+		end
+		
+		return self:Set(transformed, true)
 	end
-	
+
 	if isEqual(self.state, val) then
 		return self
 	end
 	
-	local is_mutated = (self.const ~= "nil") and (self.const ~= getStateType(val))
-	
-	if is_mutated then
+	local assigned = (self.const ~= "nil")
+	local isMutated = (val~=nil) and assigned 
+		and (self.const ~= getStateType(val))
+
+	if isMutated then
 		error("Cannot change state type of zap container!")
+	else
+		if not assigned then
+			self.const = getStateType(val)
+		end
 	end
 	
-	self.const = getStateType(val)
 	self.state = val
-	
-	if hasObservers(self) then
+
+	if self:_hasObservers() then
 		self:_runWatcherThread(val)
 	end
-	
+
 	return self
 end
 
---@ Constructors
+--@constructors
 
-function Zappy.dep(to_dep, fn)
+function Zappy.dep(super, fn)
 	local self = Zappy.new()
-	local setter = Zappy.getSetter(self, fn)
-	
-	to_dep:catch(self, setter)
-	setter(to_dep:peek())
-	
+	local setter = self:_getSetter(fn)
+
+	super:Catch(self, setter)
+	setter(super:Peek())
+
 	return self
 end
 
 function Zappy.new(init)
 	if Zappy.is(init) then
 		local self = Zappy.new()
-		
-		init:catch(self, Zappy.getSetter(self))
-		
+
+		init:Catch(self, self:_getSetter())
+
 		return self
 	end
-	
+
 	return setmetatable({
 		state = init;
 		const = getStateType(init);
-		catchers = setmetatable({}, TEMP_KEYS);
+		catchers = setmetatable({}, WEAK_KEYS);
+		
+		[OBSV_HEAD_NODE] = nil;
+		[OBSV_TAIL_NODE] = nil;
 	}, Zappy)
 end
 
