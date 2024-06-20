@@ -7,7 +7,7 @@
 ]]
 
 --[[
-	Version => 1.0 (Release)
+	Version => 1.2
 ]]
 
 local OBSV_HEAD_NODE = "obsvhead"
@@ -79,18 +79,14 @@ do
 			return
 		end
 
-		if self.prev then
-			--@ this is a trailing node
-			-- therefore, detachment is affordable
-			
+		if self.prev and self.next then
+			--@ detachment is affordable b/c this is a middle-node
+
 			self.prev.next = self.next -- connects the previous node to the next
-			
-			if self.next then
-				self.next.prev = self.prev -- connects the next node to the previous
-			end
-			
-			self.prev = nil
-			self.next = nil
+			self.prev = nil	
+
+			self.next.prev = self.prev -- connects the next node to the previous
+			self.next = nil	
 		end
 
 		self.fn = nil
@@ -112,7 +108,7 @@ Zappy.__index = Zappy
 
 do
 	--@static
-	
+
 	function Zappy.is(obj)
 		return type(obj) == "table" 
 			and getmetatable(obj) == Zappy
@@ -121,16 +117,16 @@ do
 	function Zappy:isTuple()
 		return isTuple(self.state)
 	end
-	
+
 	--@private
-	
+
 	function Zappy:_hasObservers()
 		local _, catch = next(self.catchers)
 
 		return self[OBSV_HEAD_NODE] ~= nil
 			or catch ~= nil
 	end
-	
+
 	function Zappy:_getSetter(fn)
 		--@ mainly used for observers
 		-- arg passed into observer is the literal
@@ -174,9 +170,11 @@ do
 
 		task.spawn(freeThread, fn, ...)	
 	end
-	
+
 	function Zappy:_runWatcherThread(state)
-		local node = self[OBSV_HEAD_NODE]
+		local head = self[OBSV_HEAD_NODE]
+		local tail = self[OBSV_TAIL_NODE]
+
 		local catchers = self.catchers
 
 		for key, catcher in catchers do
@@ -186,19 +184,35 @@ do
 				catchers[key] = nil
 			end
 		end
-		
-		if node and (node.fn==nil) then
+
+		if head and (head.fn==nil) then
 			--@ since the head-node cannot detach itself without reference to the zap-state
 			-- we have to remove it ourselves
-			
-			node = node.next
-			self[OBSV_HEAD_NODE] = node
-		end
-		
-		while (node) do	
-			spawnThread(node.fn, state)
 
-			node = node.next
+			head = head.next
+			self[OBSV_HEAD_NODE] = head
+		end
+
+		if tail and (tail.fn==nil) then
+			tail.prev.next = tail.next
+
+			if tail.next then
+				tail.next.prev = tail.prev
+			end
+
+			self[OBSV_TAIL_NODE] = tail.next or tail.prev
+		end
+
+		while (head) do	
+			if (not head.fn) then
+				head = head.next
+
+				continue
+			end
+
+			spawnThread(head.fn, state)
+
+			head = head.next
 		end
 	end
 end
@@ -209,20 +223,26 @@ function Zappy:Destroy()
 	self.state = nil
 	self.const = nil
 	self.catchers = nil
-	
+
 	self[OBSV_HEAD_NODE] = nil
 	self[OBSV_TAIL_NODE] = nil
-	
+
 	setmetatable(self, nil)
 end
 
 function Zappy:Observe(fn)
 	local tail = self[OBSV_TAIL_NODE]
-	local node = Observer.new(fn, tail)
+	local node = Observer.new(fn)
 
 	if tail then
-		tail.next = node
-		
+		if (tail.fn==nil) then
+			node.prev = tail.prev
+			node.prev.next = node
+		else
+			node.prev = tail
+			tail.next = node
+		end
+
 		self[OBSV_TAIL_NODE] = node
 	else
 		self[OBSV_HEAD_NODE] = node
@@ -234,25 +254,25 @@ end
 
 function Zappy:Catch(key, fn)
 	local node = Observer.new(fn)
-	
+
 	self.catchers[key] = node
-	
+
 	return node
 end
 
 function Zappy:Reduce(fn)
 	local success, val = pcall(fn, self.state)
-	
+
 	if (not success) then
 		warn("Couldn't set as reducer by reason of the following error ... ", val)	
-		
+
 		return	
 	end
-	
+
 	self.reducer = fn
 	self:Set(
 		val, true)
-	
+
 	return self
 end
 
@@ -266,7 +286,7 @@ function Zappy:Slice(start, terminate)
 
 	assert(isTuple, "Attempt to slice a non-tuple")
 	assert(start <= terminate and terminate <= #self.state, "Attempt to cross tuple boundaries with the start and terminate args!")
-	
+
 	local slice = {}
 
 	for i = start or 1, terminate or #self.state do
@@ -279,13 +299,13 @@ end
 function Zappy:Unpack()
 	local isTuple = self:isTuple()
 	local isString = (self.const == "string")
-	
+
 	if (not isTuple) and isString then
 		return self.state:split("")
 	end
-	
+
 	assert(isTuple, "Attempt to unpack an object that isn't a tuple or string")
-	
+
 	return unpack(self.state)
 end
 
@@ -302,20 +322,20 @@ function Zappy:Set(val, bypass)
 
 	if (not bypass) and reducer then
 		local success, transformed = pcall(reducer, val)
-		
+
 		if (not success) then
 			warn("Reducer encountered error ...", transformed)
-			
+
 			return
 		end
-		
+
 		return self:Set(transformed, true)
 	end
 
 	if isEqual(self.state, val) then
 		return self
 	end
-	
+
 	local assigned = (self.const ~= "nil")
 	local isMutated = (val~=nil) and assigned 
 		and (self.const ~= getStateType(val))
@@ -327,7 +347,7 @@ function Zappy:Set(val, bypass)
 			self.const = getStateType(val)
 		end
 	end
-	
+
 	self.state = val
 
 	if self:_hasObservers() then
@@ -362,7 +382,7 @@ function Zappy.new(init)
 		state = init;
 		const = getStateType(init);
 		catchers = setmetatable({}, WEAK_KEYS);
-		
+
 		[OBSV_HEAD_NODE] = nil;
 		[OBSV_TAIL_NODE] = nil;
 	}, Zappy)
